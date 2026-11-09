@@ -578,6 +578,20 @@ impl<M: SinkMessages> Deliverer<'_, M> {
             progress.last_unflushed = None;
             progress.unflushed_messages = 0;
         }
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.partition_id == partition_id)
+        {
+            self.batch = None;
+        }
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|message| message.partition_id == partition_id)
+        {
+            self.next = None;
+        }
     }
 
     /// Stops the delivery at `partitions`. The other partitions flush once and every proven
@@ -605,20 +619,7 @@ impl<M: SinkMessages> Deliverer<'_, M> {
         start: PollingStrategy,
     ) -> Result<(), RuntimeError> {
         self.partitions.remove(&partition_id);
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.partition_id == partition_id)
-        {
-            self.batch = None;
-        }
-        if self
-            .next
-            .as_ref()
-            .is_some_and(|message| message.partition_id == partition_id)
-        {
-            self.next = None;
-        }
+        self.forget(partition_id);
         match self.messages.seek(partition_id, start).await {
             Ok(()) => Ok(()),
             // A rebalance moved the partition, and its new owner resumes at the stored offset.
@@ -1779,6 +1780,24 @@ mod tests {
         assert_eq!(partitions, [0, 1]);
         assert!(reason.contains("[(0, 0), (1, 0)]"), "{reason}");
         assert!(log.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_transient_flush_failure_when_recovering_should_redeliver_from_first_unflushed() {
+        let plugin_id = plugin(&[], &[1, 0]);
+        let mut log = FakeLog::json(&[(0, 4)]);
+        let delivery = delivery(DeliveryOptions {
+            retry_max_attempts: NonZeroU32::new(2),
+            flush_interval: Some(Duration::from_secs(3600)),
+            flush_max_messages: 2,
+            ..test_options()
+        });
+
+        deliver_all(plugin_id, &mut log, delivery)
+            .await
+            .expect("transient flush failure should recover and deliver to the end");
+
+        assert_eq!(log.commits(), vec![(0, 3)]);
     }
 
     #[test]
